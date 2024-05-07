@@ -1,0 +1,91 @@
+import pickle
+from collections import defaultdict
+from statistics import mean
+
+class WeightedLevenshteinModel:
+    def __init__(self, reference_strings, costs):
+        self.reference_strings = reference_strings
+        self.costs = costs
+
+    def predict_label(self, feature):
+        avg_distances = defaultdict(list)
+        for label, refs in self.reference_strings.items():
+            for ref in refs:
+                # Compute weighted Levenshtein distance
+                dist = self.weighted_levenshtein(feature, ref)
+                avg_distances[label].append(dist)
+        min_avg_distance = min((mean(distances), label) for label, distances in avg_distances.items())
+        return min_avg_distance[1]
+
+    def weighted_levenshtein(self, s1, s2):
+        if len(s1) < len(s2):
+            return self.weighted_levenshtein(s2, s1)
+
+        if len(s2) == 0:
+            return len(s1)
+
+        previous_row = range(len(s2) + 1)
+
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+
+            for j, c2 in enumerate(s2):
+                if ('', c2) not in self.costs:
+                    self.costs[('', c2)] = 1
+                if (c1, '') not in self.costs:
+                    self.costs[(c1, '')] = 1
+                if (c1, c2) not in self.costs:
+                    self.costs[(c1, c2)] = 1
+
+                insert_cost = previous_row[j + 1] + self.costs[('', c2)]
+                delete_cost = current_row[j] + self.costs[(c1, '')]
+                substitute_cost = previous_row[j] + (self.costs[(c1, c2)] if c1 != c2 else 0)
+                current_row.append(min(insert_cost, delete_cost, substitute_cost))
+
+            previous_row = current_row
+
+        return previous_row[-1]
+
+# Define reference strings for each label category
+reference_strings = {
+    "animal": ["dog", "cat", "elephant", "rabbit", "hamster", "mouse", "fish", "bird", "snake", "giraffe", "bear", "turtle", "crab"],
+    "thing": ["book", "bottle", "mug", "cup", "pen", "phone", "car", "bicycle", "laptop", "calendar", "chair", "table", "lamp", "notebook", "keyboard", "hat", "glasses", "watch", "bracelet", "ring"],
+    "data": ["email", "phone", "name", "dob", "gender", "address", "city", "state", "zip code", "age", "occupation", "education", "height", "weight"]
+}
+
+# Define costs for different operations
+# Weights are assigned based on domain knowledge or empirical observations
+# Here, we assume equal costs for substitution, deletion, and insertion
+costs = {
+    ('', ''): 0,  # No cost for matching characters
+    ('', 'a'): 1, ('a', ''): 1,  # Cost of inserting 'a'
+    ('', 'b'): 1, ('b', ''): 1,  # Cost of inserting 'b'
+    ('a', 'b'): 1, ('b', 'a'): 1,  # Cost of substituting 'a' with 'b'
+    ('a', 'a'): 0, ('b', 'b'): 0,  # No cost for matching characters
+}
+
+# Create an instance of the model
+model = WeightedLevenshteinModel(reference_strings, costs)
+
+# Export the model
+with open('weighted_levenshtein_model.pkl', 'wb') as f:
+    pickle.dump(model, f)
+
+# Load the model from the file
+with open('weighted_levenshtein_model.pkl', 'rb') as f:
+    model = pickle.load(f)
+
+# Sample feature-label pairs
+sample_data = [
+    ("dog", "animal"),
+    ("cat", "animal"),
+    ("pen", "thing"),
+    ("email", "data"),
+    ("book", "thing"),
+    ("city", "data")
+]
+
+# Test predictions
+for feature, expected_label in sample_data:
+    predicted_label = model.predict_label(feature)
+    print(f"Feature: {feature}, Predicted Label: {predicted_label}, Expected Label: {expected_label}")
