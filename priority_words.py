@@ -12,9 +12,9 @@ def compute_common_words(sentences, threshold=2):
 
 # Example sentences
 sentences = [
-    "Attorney full name",
-    "Banker name",
-    "Doctor name"
+    "name",
+    "name",
+    "name"
 ]
 
 common_words = compute_common_words(sentences)
