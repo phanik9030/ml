@@ -34,8 +34,9 @@ def predict_masked_text(input_string, reference_strings):
         
         # Get the predicted token probabilities for [MASK]
         mask_token_index = tokenizer.convert_tokens_to_ids('[MASK]')
-        predictions = outputs.logits[0, masked_input_ids[0] == mask_token_index]
-
+        mask_token_position = (masked_input_ids == mask_token_index).nonzero(as_tuple=True)[1]
+        predictions = outputs.logits[0, mask_token_position[0]]
+        
         # Decode predictions to find top tokens
         predicted_indices = predictions.topk(5).indices.tolist()
         predicted_tokens = tokenizer.convert_ids_to_tokens(predicted_indices)
