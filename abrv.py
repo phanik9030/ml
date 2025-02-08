@@ -84,6 +84,15 @@ for word in abbrv:
     else:
         answer = "Unclear"
 
+    # Split the string by newlines and filter out empty lines
+    lines = [line.strip() for line in string.split('\n') if line.strip()]
+    
+    # Extract the line starting with "A."
+    for line in lines:
+        if line.startswith("A."):
+            print(line)
+            break
+
     # Print the word and the answer
     print(f"Word: {word}")
     print(f"Full word? {response}")
