@@ -105,3 +105,90 @@ model.save_pretrained(output_dir)
 tokenizer.save_pretrained(output_dir)
 print(f"Model saved to {output_dir}")
 
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+import torch
+from datasets import Dataset
+import pandas as pd
+import os
+
+# Check if CUDA is available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+torch.cuda.empty_cache()
+
+output_dir = "/content/drive/My Drive/trained_business_terms_model"
+
+# 8. Predict functions with improved cleaning
+def predict_definition(term, max_length=256):
+    loaded_model = AutoModelForCausalLM.from_pretrained(output_dir).to(device)
+    loaded_tokenizer = AutoTokenizer.from_pretrained(output_dir)
+    
+    input_text = f"Business Term: {term}\nDefinition:"
+    inputs = loaded_tokenizer(input_text, return_tensors="pt").to(device)
+    
+    with torch.no_grad():
+        outputs = loaded_model.generate(
+            **inputs,
+            max_length=max_length,
+            num_return_sequences=1,
+            temperature=0.2,  # Lowered for more coherence
+            top_p=0.85,       # Tightened for less randomness
+            do_sample=True,
+            pad_token_id=loaded_tokenizer.eos_token_id,
+            eos_token_id=loaded_tokenizer.convert_tokens_to_ids('<|eos|>'),
+        )
+    
+    generated_text = loaded_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    try:
+        definition = generated_text.split("Definition:")[1].split('<|eos|>')[0].strip()
+        # Remove any trailing nonsense
+        definition = ' '.join(definition.split()[:10])  # Limit to first 10 words
+        return definition
+    except IndexError:
+        return "Failed to generate a valid definition."
+
+def predict_associated_term(column, max_length=50):
+    loaded_model = AutoModelForCausalLM.from_pretrained(output_dir).to(device)
+    loaded_tokenizer = AutoTokenizer.from_pretrained(output_dir)
+    
+    input_text = f"Column: {column}\nAssociatedTerm:"
+    inputs = loaded_tokenizer(input_text, return_tensors="pt").to(device)
+    
+    with torch.no_grad():
+        outputs = loaded_model.generate(
+            **inputs,
+            max_length=max_length,
+            num_return_sequences=1,
+            temperature=0.3,
+            top_p=0.80,
+            do_sample=True,
+            pad_token_id=loaded_tokenizer.eos_token_id,
+            eos_token_id=loaded_tokenizer.convert_tokens_to_ids('<|eos|>'),
+        )
+    
+    generated_text = loaded_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    try:
+        associated_term = generated_text.split("AssociatedTerm:")[1].split('<|eos|>')[0].strip()
+        # Remove any trailing nonsense
+        associated_term = ' '.join(associated_term.split()[:5])  # Limit to first 5 words
+        return associated_term
+    except IndexError:
+        return "Failed to generate a valid associated term."
+
+# 9. Test
+new_terms = ["Cash Flow Year over Year Change Percentage", "Appraisal Basic Valuation Type", "Vendor Name"]
+new_columns = ["xfer_mthd_sub", "rgn_id", "target_bal"]
+
+print("\nPredicting definitions for new terms using CUDA:")
+for term in new_terms:
+    definition = predict_definition(term)
+    print(f"Term: {term}")
+    print(f"Predicted Definition: {definition}\n")
+
+print("Predicting associated terms for new columns using CUDA:")
+for column in new_columns:
+    associated_term = predict_associated_term(column)
+    print(f"Column: {column}")
+    print(f"Predicted Associated Term: {associated_term}\n")
+
