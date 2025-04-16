@@ -1,42 +1,51 @@
-  const { Parser } = require("node-sql-parser");
-  const parser = new Parser();
-  
-  let ast = parser.astify(sql);
+  function addLimitToCTEs(sql, limit = 100) {
+    const limitText = `LIMIT ${limit}`;
 
-  // Function to recursively apply LIMIT 100 to all SELECT statements
-  function applyLimitToSelect(astNode, limitValue = 100) {
-    if (!astNode) return;
+    // Basic logic to detect SELECTs inside WITH or standalone
+    const blocks = [];
+    let i = 0;
+    let depth = 0;
+    let start = 0;
+    const tokens = sql.split("");
 
-    if (Array.isArray(astNode)) {
-      astNode.forEach((node) => applyLimitToSelect(node, limitValue));
-    } else {
-      if (astNode.type === "select" && !astNode.limit) {
-        astNode.limit = {
-          seperator: "",
-          value: [{ type: "number", value: limitValue }],
-        };
+    while (i < tokens.length) {
+      if (tokens[i] === "(") {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (tokens[i] === ")") {
+        depth--;
+        if (depth === 0) {
+          blocks.push({ start, end: i });
+        }
       }
-
-      // Recursively handle with clauses (CTEs)
-      if (astNode.with && astNode.with.clauses) {
-        astNode.with.clauses.forEach((clause) =>
-          applyLimitToSelect(clause.stmt, limitValue)
-        );
-      }
-
-      // Handle subqueries
-      if (astNode.from) {
-        astNode.from.forEach((item) => {
-          if (item.type === "subquery" && item.subquery) {
-            applyLimitToSelect(item.subquery, limitValue);
-          }
-        });
-      }
+      i++;
     }
+
+    // Insert LIMIT inside each detected SQL block if missing
+    let result = sql;
+    let offset = 0;
+
+    blocks.forEach(({ start, end }) => {
+      const block = result.slice(start + offset, end + 1 + offset);
+      const hasLimit = /\blimit\s+\d+/i.test(block);
+
+      if (!hasLimit && /\bselect\b/i.test(block)) {
+        // Inject LIMIT before the closing parenthesis
+        const modifiedBlock =
+          block.replace(/\)\s*$/, ` ${limitText})`) || `${block} ${limitText}`;
+        result =
+          result.slice(0, start + offset) +
+          modifiedBlock +
+          result.slice(end + 1 + offset);
+        offset += limitText.length + 1;
+      }
+    });
+
+    // Also apply LIMIT to outer SELECT if needed
+    const outerHasLimit = /\blimit\s+\d+\s*;?\s*$/i.test(result);
+    if (!outerHasLimit && /\bselect\b/i.test(result)) {
+      result = result.trim().replace(/;?$/, ` ${limitText};`);
+    }
+
+    return result;
   }
-
-  // Apply limit to all select statements
-  applyLimitToSelect(ast, 100);
-
-  // Convert back to SQL
-  const modifiedSql = parser.sqlify(ast);
