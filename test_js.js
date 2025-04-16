@@ -49,3 +49,73 @@
 
     return result;
   }
+
+function addLimitToCTEs(sql, limit = 100) {
+  const limitText = `LIMIT ${limit}`;
+
+  // Utility to recursively inject LIMIT into nested SELECTs
+  function injectLimit(sqlBlock) {
+    const selectRegex = /\bSELECT\b[\s\S]*?(?=(\bSELECT\b|\bFROM\b|$))/gi;
+    let result = sqlBlock;
+    let match;
+    let insertPositions = [];
+
+    // Find all SELECTs that are not already followed by a LIMIT in the same scope
+    const selectBlocks = [];
+    const stack = [];
+    let current = '';
+    let inQuote = false;
+    let quoteChar = '';
+    let i = 0;
+
+    while (i < result.length) {
+      const char = result[i];
+      current += char;
+
+      if ((char === `'` || char === `"`) && result[i - 1] !== '\\') {
+        if (!inQuote) {
+          inQuote = true;
+          quoteChar = char;
+        } else if (quoteChar === char) {
+          inQuote = false;
+        }
+      }
+
+      if (!inQuote) {
+        if (char === '(') {
+          stack.push(current.length - 1);
+        } else if (char === ')') {
+          const start = stack.pop();
+          if (start !== undefined) {
+            const block = current.slice(start, current.length);
+            const inner = current.slice(start + 1, current.length - 1);
+            if (
+              /\bSELECT\b/i.test(inner) &&
+              !/\bLIMIT\b\s+\d+/i.test(inner)
+            ) {
+              // inject limit inside this block
+              const modifiedInner = injectLimit(inner.trim());
+              const withLimit = `${modifiedInner} ${limitText}`;
+              current = current.slice(0, start + 1) + withLimit + ')';
+            }
+          }
+        }
+      }
+
+      i++;
+    }
+
+    // After handling nested, add LIMIT to top-level SELECT if not already there
+    if (
+      /\bSELECT\b/i.test(current) &&
+      /\bFROM\b/i.test(current) &&
+      !/\bLIMIT\b\s+\d+/i.test(current)
+    ) {
+      current = current.replace(/;?\s*$/, ` ${limitText};`);
+    }
+
+    return current;
+  }
+
+  return injectLimit(sql);
+}
