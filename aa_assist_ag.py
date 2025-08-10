@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os, re, json, uuid, math, difflib
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
 
 # -----------------------------
 # OpenAI helpers (GPT-4o + embeddings)
@@ -13,6 +14,87 @@ try:
     from openai import OpenAI  # pip install openai>=1.30.0
 except Exception:
     OpenAI = None  # type: ignore
+
+# Broad set of refinement examples to guide GPT-4o in editing SQL incrementally
+SQL_REFINEMENT_EXAMPLES = [
+    # Filters
+    {"instruction":"filter country = 'US'","effect":"Add WHERE/AND clause with country = 'US' in the most relevant CTE or base query."},
+    {"instruction":"remove the country filter","effect":"Remove country predicate from WHERE/AND clauses; keep other predicates untouched."},
+    {"instruction":"change the date window to last 90 days","effect":"Adjust date predicates to CURRENT_DATE - INTERVAL '90 days' consistently in relevant CTEs."},
+    {"instruction":"only include orders since 2025-07-01","effect":"Replace or add date predicate: order_date >= DATE '2025-07-01'."},
+    {"instruction":"filter segment in ('Retail','SMB')","effect":"Add WHERE/AND with segment IN ('Retail','SMB')."},
+
+    # Columns & CASE
+    {"instruction":"add condition to total_amount: > 50 then 'y' else 'n' as amount_flag","effect":"Add CASE WHEN total_amount > 50 THEN 'y' ELSE 'n' END AS amount_flag to SELECT; if grouped, either aggregate or add to GROUP BY."},
+    {"instruction":"add a boolean column big_order if total_amount > 200","effect":"Add CASE WHEN total_amount > 200 THEN true ELSE false END AS big_order to SELECT; update GROUP BY if needed."},
+    {"instruction":"bucket total_amount into [0,50), [50,200), [200,+inf) as amount_bucket","effect":"Add CASE with ranges and alias amount_bucket; update GROUP BY if needed."},
+    {"instruction":"coalesce null segment to 'Unknown'","effect":"Wrap segment with COALESCE(segment,'Unknown') and alias appropriately; adjust GROUP BY if needed."},
+    {"instruction":"cast total_amount to numeric(12,2)","effect":"Wrap total_amount in CAST(total_amount AS numeric(12,2)) with correct alias."},
+
+    # Aggregations / Grouping
+    {"instruction":"sum total_amount as revenue and count distinct orders","effect":"Add SUM(total_amount) AS revenue, COUNT(DISTINCT order_id) AS orders; keep GROUP BY stable."},
+    {"instruction":"group by segment and country","effect":"Add country to GROUP BY and SELECT (with an alias if needed)."},
+    {"instruction":"aggregate to daily grain using order_date::date","effect":"Add date_trunc('day', order_date) or order_date::date in SELECT and GROUP BY; ensure aliases are used consistently."},
+    {"instruction":"percent of total revenue per segment","effect":"Compute SUM(total_amount) AS revenue and revenue / SUM(revenue) OVER () AS pct_of_total; keep both in SELECT."},
+    {"instruction":"add average order value (AOV)","effect":"Add SUM(total_amount)/NULLIF(COUNT(DISTINCT order_id),0) AS aov."},
+
+    # Window functions
+    {"instruction":"rank segments by revenue desc","effect":"Add RANK() OVER (ORDER BY revenue DESC) AS revenue_rank in the outer SELECT that sees revenue."},
+    {"instruction":"dense_rank per country by revenue","effect":"Add DENSE_RANK() OVER (PARTITION BY country ORDER BY revenue DESC) AS revenue_rank."},
+    {"instruction":"row_number per segment by order_date desc","effect":"Add ROW_NUMBER() OVER (PARTITION BY segment ORDER BY order_date DESC) AS rn in appropriate scope."},
+    {"instruction":"lag revenue by 1 day","effect":"Add LAG(revenue,1) OVER (ORDER BY day) AS revenue_lag_1; ensure 'day' exists in SELECT."},
+
+    # Top-N patterns
+    {"instruction":"top 5 segments by revenue","effect":"Order by revenue DESC and LIMIT 5 in the appropriate outer SELECT."},
+    {"instruction":"top 3 per country by revenue","effect":"Use ROW_NUMBER() OVER (PARTITION BY country ORDER BY revenue DESC) AS rn then filter rn <= 3 in an outer SELECT/CTE."},
+
+    # Joins
+    {"instruction":"join products to order_items on product_id","effect":"Add JOIN sales.order_items oi ON oi.order_id = o.order_id then JOIN sales.products p ON p.product_id = oi.product_id in the right CTE."},
+    {"instruction":"left join customers to orders","effect":"Use LEFT JOIN sales.customers c ON c.customer_id = o.customer_id; ensure aliases remain consistent."},
+    {"instruction":"anti join customers with no orders","effect":"Use NOT EXISTS (SELECT 1 FROM sales.orders o WHERE o.customer_id = c.customer_id)."},
+    {"instruction":"semi join customers who have orders","effect":"Use EXISTS (SELECT 1 FROM sales.orders o WHERE o.customer_id = c.customer_id)."},
+
+    # Distinct / De-duplication
+    {"instruction":"distinct customers by latest order_date","effect":"Use ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date DESC) AS rn and filter rn=1."},
+    {"instruction":"remove duplicates by order_id","effect":"Select DISTINCT ON (order_id) * with ORDER BY order_id, <tie-breakers> or use window+filter rn=1."},
+
+    # HAVING / Post-aggregation filters
+    {"instruction":"only include segments where revenue > 1000","effect":"Add HAVING SUM(total_amount) > 1000 or WHERE revenue > 1000 in an outer SELECT if revenue is already computed."},
+    {"instruction":"filter where orders_count >= 5","effect":"Use HAVING COUNT(DISTINCT order_id) >= 5 or filter outer alias orders_count >= 5."},
+
+    # Ordering / Limit / Offset
+    {"instruction":"order by revenue desc then segment asc","effect":"Add ORDER BY revenue DESC, segment ASC on the outermost SELECT."},
+    {"instruction":"limit 10 offset 20","effect":"Add LIMIT 10 OFFSET 20 to the outermost SELECT for paging."},
+
+    # UNION / EXCEPT / INTERSECT
+    {"instruction":"union with last month same structure","effect":"Append UNION ALL with a parallel SELECT using last month’s date filter; align columns/aliases."},
+    {"instruction":"intersect with customers in mkt.touch list","effect":"Use INTERSECT or INNER JOIN with touch list; ensure column compatibility or join keys are correct."},
+    {"instruction":"exclude VIP customers","effect":"Use EXCEPT with VIP customer_ids or add WHERE NOT IN (...) / NOT EXISTS."},
+
+    # JSON / Arrays / Strings
+    {"instruction":"extract city from customers.meta->>'city'","effect":"Add c.meta->>'city' AS city (Postgres JSON) and group/filter as required."},
+    {"instruction":"unnest tags array and count per tag","effect":"Use CROSS JOIN LATERAL unnest(tags) AS tag then GROUP BY tag."},
+    {"instruction":"case-insensitive contains on product name","effect":"Use WHERE p.name ILIKE '%term%'."},
+
+    # Safe math & null handling
+    {"instruction":"divide revenue by orders safely","effect":"Use SUM(total_amount)/NULLIF(COUNT(DISTINCT order_id),0) AS revenue_per_order."},
+    {"instruction":"treat null country as 'Unknown'","effect":"Use COALESCE(country,'Unknown') and adjust GROUP BY."},
+
+    # Time functions
+    {"instruction":"week-over-week revenue","effect":"Aggregate by week (date_trunc('week', order_date)) and add LAG(revenue) OVER (ORDER BY week) then compute WoW change."},
+    {"instruction":"month-to-date and previous month totals","effect":"Build CTEs for current month and previous month; compute sums and join or UNION for comparison."},
+
+    # Reshaping
+    {"instruction":"pivot revenue by segment into columns","effect":"Use FILTERed aggregates: SUM(revenue) FILTER (WHERE segment='Retail') AS retail_revenue, etc."},
+    {"instruction":"unpivot columns to rows","effect":"Use UNION ALL to unpivot or use JSON/object/unnest tricks depending on source structure."},
+
+    # Grain changes (careful edits)
+    {"instruction":"change grain to one row per customer","effect":"Move aggregations to per-customer level; ensure SELECT/GROUP BY reflect new grain; adjust dependent logic/joins."},
+    {"instruction":"drill down to line items per product","effect":"Join order_items/products; group at product or item level; propagate changes to downstream CTEs."},
+
+    # Parameters
+    {"instruction":"parameterize lookback_days as :lookback","effect":"Replace INTERVAL literals with make_interval(days => :lookback) or CURRENT_DATE - (:lookback || ' days')::interval (if your runtime supports parameters)."},
+]
 
 def _client() -> Optional[OpenAI]:
     if not OPENAI_API_KEY or not OpenAI:
@@ -280,16 +362,20 @@ CANON_INTENTS = [
     ("select-schemas",   "pick or switch schema: use schema sales, set schema public or multiple schemas"),
     ("discover-tables",  "list tables in a schema, browse tables"),
     ("describe-table",   "describe a table structure, columns, types"),
-    ("create",           "create or build sql from natural language"),
+    ("create",           "create or build NEW sql from natural language; user asks to write/generate a query, include columns, totals, filters"),
     ("refine",           "refine or modify previous sql"),
     ("preview",          "preview data or fetch rows or get records or show results"),
     ("validate",         "validate or lint the last sql"),
     ("save",             "save insight with name ttl active schedule"),
-    ("update",           "update or edit an existing insight details"),
+    ("update",           "update or edit an EXISTING saved insight's metadata (name, ttl, active, schedule), not for creating or changing new sql"),
     ("explain-insight",  "explain an existing insight in natural language"),
     ("explain-sql",      "explain a sql query"),
     ("help",             "how to use, what can I do, help"),
     ("unknown",          "unknown or unsupported request"),
+    ("save-draft", "save current sql as a draft with a name, stash work-in-progress"),
+    ("list-drafts", "list available sql drafts"),
+    ("load-draft", "load a draft by name or id to continue work"),
+    ("delete-draft", "delete a draft by name or id"),
 ]
 
 class IntentIndex:
@@ -391,6 +477,38 @@ class Tools:
         self.catalog=catalog
         self.runner=MockRunner(MOCK_DATA)
         self.saved: Dict[str,Dict[str,Any]] = {}
+        self.saved: Dict[str, Dict[str, Any]] = {}
+        self.drafts: Dict[str, Dict[str, Any]] = {}  # <— ensure this exists
+
+    # --- Draft query handling ---
+    def save_draft(self, name: str, sql: str) -> Dict[str, Any]:
+        did = str(uuid.uuid4())
+        rec = {"id": did, "name": name, "sql": sql}
+        self.drafts[did] = rec
+        return rec
+
+    def list_drafts(self) -> List[Dict[str, Any]]:
+        return list(self.drafts.values())[::-1]
+
+    def get_draft(self, key: str) -> Optional[Dict[str, Any]]:
+        if key in self.drafts:
+            return self.drafts[key]
+        for v in self.drafts.values():
+            if v["name"] == key:
+                return v
+        return None
+
+    def delete_draft(self, key: str) -> bool:
+        if key in self.drafts:
+            del self.drafts[key]; return True
+        to_del = None
+        for did, v in self.drafts.items():
+            if v["name"] == key:
+                to_del = did; break
+        if to_del:
+            del self.drafts[to_del]; return True
+        return False
+
 
     # Data discovery
     def list_schemas(self)->List[Dict[str,Any]]:
@@ -415,36 +533,164 @@ class Tools:
         return {"tables":sorted(refs), "unknown_tables":unknown, "ok": len(unknown)==0}
 
     # LLM SQL build/refine with grounding
-    def plan_sql(self, mode:str, ask:str, prior_sql:Optional[str], grounding: Optional[Dict[str,List[str]]] = None)->Dict[str,Any]:
-        cli=_client()
-        if not cli:
-            return {"error":"OPENAI_API_KEY not set; cannot generate SQL"}
-        schemas="\n".join([f"- {s['name']}: {s['description']}" for s in self.catalog.schemas])
-        tables=[]
-        for t in self.catalog.tables:
-            cols=", ".join([f"{c['name']}:{c.get('type','')}" for c in t.get("columns",[])])
-            tables.append(f"- {t['schema']}.{t['name']}: {t['description']} | {cols}")
-        grounding_txt = ""
-        if grounding:
-            if grounding.get("tables") or grounding.get("columns"):
-                grounding_txt = "\n\nGROUNDING:\n"
-                if grounding.get("tables"):
-                    grounding_txt += "Candidate tables: " + ", ".join(grounding["tables"]) + "\n"
-                if grounding.get("columns"):
-                    grounding_txt += "Candidate columns: " + ", ".join(grounding["columns"]) + "\n"
+    # before:
+    # def plan_sql(self, mode: str, ask: str, prior_sql: Optional[str]) -> Dict[str, Any]:
 
-        sys=("You write production-grade PostgreSQL. Use CTEs, avoid SELECT *, never mutate data. "
-             "Prefer grounded tables/columns when provided.")
-        user=(f"MODE:{mode}\nSCHEMAS:\n{schemas}\nTABLES:\n"+"\n".join(tables)+
-              f"\nPRIOR_SQL:\n{prior_sql or '(none)'}{grounding_txt}\n"
-              "Return STRICT JSON: {mode, sql, explanation, expected_columns}.\n"
-              f"USER_ASK: {ask}")
-        out=gpt_json([{"role":"system","content":sys},{"role":"user","content":user}]) or {}
-        sql=out.get("sql","")
-        safe,why=self.is_safe(sql)
-        if not safe: return {"error":why}
-        lint=self.lint(sql)
-        return {"sql":sql,"explanation":out.get("explanation",""),"expected_columns":out.get("expected_columns",[]),"lint":lint}
+    # after:
+    def plan_sql(
+            self,
+            mode: str,
+            ask: str,
+            prior_sql: Optional[str],
+            grounding: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        client = _client()
+        if not client:
+            return {"error": "OPENAI_API_KEY not set; cannot generate SQL"}
+
+        # Build catalog context
+        schemas = "\n".join([f"- {s['name']}: {s['description']}" for s in self.catalog.schemas])
+        tables_ctx = []
+        for t in self.catalog.tables:
+            cols = ", ".join([f"{c['name']}:{c.get('type', '')}" for c in t.get("columns", [])])
+            tables_ctx.append(f"- {t['schema']}.{t['name']}: {t['description']} | {cols}")
+
+        # ---- Grounding (optional) ----
+        # expected keys: {"schemas": [...], "tables": [...], "columns": [...]}
+        g = grounding or {}
+        g_schemas = g.get("schemas") or []
+        g_tables = g.get("tables") or []
+        g_cols = g.get("columns") or []
+
+        grounding_text = ""
+        if g_schemas or g_tables or g_cols:
+            grounding_text = (
+                    "Grounding hints:\n"
+                    + (f"- Preferred schemas: {', '.join(g_schemas)}\n" if g_schemas else "")
+                    + (f"- Preferred tables: {', '.join(g_tables)}\n" if g_tables else "")
+                    + (f"- Preferred columns: {', '.join(g_cols)}\n" if g_cols else "")
+            )
+
+        sys = (
+            "You are a senior SQL engineer. Target: PostgreSQL. "
+            "Use CTEs; never SELECT *; never mutate data. "
+            "When refining, PRESERVE prior structure/CTEs unless the change requires altering them. "
+            "Always return a full runnable SQL."
+        )
+
+        wants_patch = (mode in {"refine"} and bool(prior_sql))
+
+        user_payload = {
+            "mode": mode,
+            "instruction": ask,
+            "schemas": [s["name"] for s in self.catalog.schemas],
+            "tables": tables_ctx,
+            "prior_sql": prior_sql or "",
+            "return_format": "json with keys: mode, sql, explanation, expected_columns" + (
+                ", patch" if wants_patch else ""),
+            "patch_format": "unified diff against prior_sql, minimal context, or empty string if not applicable" if wants_patch else "",
+            "notes": [
+                "If user asks to add a CASE/condition/column, edit the SELECT list and GROUP BY only as needed.",
+                "If adding a CASE using a non-aggregated column within an aggregated query, either (a) aggregate it, or (b) add it to GROUP BY and explain the grain change.",
+                "Keep table aliases stable.",
+            ],
+            "examples": SQL_REFINEMENT_EXAMPLES,  # keep your large example set
+            "grounding": {
+                "schemas": g_schemas,
+                "tables": g_tables,
+                "columns": g_cols,
+            }
+        }
+
+        # Append grounding_text for extra steer, if present
+        if grounding_text:
+            user_payload["instruction"] = f"{ask}\n\n{grounding_text}"
+
+        out = gpt_json([
+            {"role": "system", "content": sys},
+            {"role": "user", "content": json.dumps(user_payload)}
+        ], temperature=0.2) or {}
+
+        sql = (out.get("sql") or "").strip()
+        if mode == "refine" and not sql and prior_sql:
+            sql2 = self._apply_simple_refinement(ask, prior_sql)
+            if sql2:
+                sql = sql2
+                out["explanation"] = (out.get("explanation") or "") + " (Applied simple refinement fallback.)"
+
+        if not sql:
+            return {"error": "Could not produce SQL"}
+
+        safe, why = self.is_safe(sql)
+        if not safe:
+            return {"error": why}
+
+        lint = self.lint(sql)
+        return {
+            "sql": sql,
+            "explanation": out.get("explanation", ""),
+            "expected_columns": out.get("expected_columns", []),
+            "lint": lint,
+            "patch": out.get("patch", "")
+        }
+
+    def _apply_simple_refinement(self, instruction: str, prior_sql: str) -> Optional[str]:
+        """
+        Very small safety net for common instructions like:
+          - add condition to <col> if value > N then 'y' else 'n' [as alias]
+        It tries to inject a CASE expression into the SELECT and, if needed, GROUP BY.
+
+        If the query has GROUP BY and we add a non-aggregated CASE alias,
+        we’ll add the alias to GROUP BY to keep it runnable.
+        """
+        ins = instruction.lower()
+
+        # detect pattern e.g. "add condition to total_amount if amount value is greater than 50 then return 'y' or if amount value is less than 50 return 'n'"
+        # normalize to a CASE
+        m_gt = re.search(r"(?:to|on)\s+([a-z0-9_.]+).*?(greater\s+than|>\s*)(\d+(?:\.\d+)?)", ins)
+        m_lt = re.search(r"(?:to|on)\s+([a-z0-9_.]+).*?(less\s+than|<\s*)(\d+(?:\.\d+)?)", ins)
+        # If neither, try simpler catch: "add condition .* total_amount .* > 50 .* return 'y' .* < 50 .* return 'n'"
+        col = None
+        gt_val = lt_val = None
+        if m_gt:
+            col = m_gt.group(1).split(".")[-1]
+            gt_val = m_gt.group(3)
+        if m_lt:
+            col = col or m_lt.group(1).split(".")[-1]
+            lt_val = m_lt.group(3)
+
+        if not col:
+            # attempt to detect a column token by name (e.g., total_amount)
+            m_col = re.search(r"\b([a-z_][a-z0-9_]*)\b.*?(?:greater|less|>|<)", ins)
+            if m_col:
+                col = m_col.group(1)
+
+        if not col:
+            return None
+
+        # default thresholds if only one was found
+        gt_val = gt_val or "50"
+        lt_val = lt_val or "50"
+
+        case_expr = f"CASE WHEN {col} > {gt_val} THEN 'y' WHEN {col} < {lt_val} THEN 'n' ELSE NULL END AS amount_flag"
+
+        # Insert into SELECT list
+        m_sel = re.search(r"select\s+(.*?)\s+from\s", prior_sql, re.I | re.S)
+        if not m_sel:
+            return None
+        sel_block = m_sel.group(1).strip()
+        if case_expr.lower() in sel_block.lower():
+            return prior_sql  # already present
+
+        new_sel = sel_block + ",\n    " + case_expr
+        sql2 = prior_sql[:m_sel.start(1)] + new_sel + prior_sql[m_sel.end(1):]
+
+        # If GROUP BY exists and amount_flag not grouped or aggregated, add it
+        if re.search(r"\bgroup\s+by\b", sql2, re.I):
+            if not re.search(r"\bamount_flag\b", sql2, re.I):
+                sql2 = re.sub(r"(group\s+by\s+)([^\n;]+)", r"\1\2, amount_flag", sql2, flags=re.I)
+
+        return sql2
 
     def preview_sql(self, sql:str, limit:int=5)->Dict[str,Any]:
         m=re.search(r"from\s+([a-z0-9_]+\.[a-z0-9_]+)", sql, re.I)
@@ -544,6 +790,15 @@ def gpt_parse_intent(user_input: str, schemas: List[Dict[str, Any]], insights: L
             {"in":"preview", "intent":"preview_last_sql","slots":{}},
             {"in":"validate", "intent":"validate","slots":{}},
             {"in":"save as us_rev ttl 14 active true", "intent":"save","slots":{"save":{"name":"us_rev","ttl":14,"active":True}}},
+            {"in": "save draft as my_temp_sql", "intent": "save_draft", "slots": {"draft": {"name": "my_temp_sql"}}},
+            {"in": "list drafts", "intent": "list_drafts", "slots": {}},
+            {"in": "load draft my_temp_sql", "intent": "load_draft", "slots": {"draft_name": "my_temp_sql"}},
+            {"in": "delete draft my_temp_sql", "intent": "delete_draft", "slots": {"draft_name": "my_temp_sql"}},
+            {"in": "get back my draft query", "intent": "load_draft", "slots": {}},
+            {"in": "save as draft", "intent": "save_draft", "slots": {"draft": {"name": null}}},
+            {"in": "save draft as my_temp_sql", "intent": "save_draft", "slots": {"draft": {"name": "my_temp_sql"}}},
+            {"in": "save to draft", "intent": "save_draft", "slots": {"draft": {"name": null}}},
+
         ]
     })
     try:
@@ -732,6 +987,70 @@ def router_node(state: Dict[str, Any]) -> Dict[str, Any]:
         state["intent"] = "offtopic"
         return state
 
+    # ---------- NEW: high-priority keyword overrides ----------
+    if re.search(r"\b(add|append|include|also|and)\b", low) and (
+            re.search(r"\b(condition|filter|column|case|join|cte|limit|order|group|window|partition)\b", low)
+            or re.search(r"\bthen\b.*\breturn\b", low)  # "if ... then return ..."
+    ):
+        if state.get("last_sql"):
+            state["intent"] = "refine"
+            return state
+    # 6) DRAFTS  (put this BEFORE 'SAVE INSIGHT')
+    if re.search(r"\bsave\s+(?:as\s+)?draft\b", low) or re.search(r"\bsave\s+to\s+draft\b", low):
+        state["intent"] = "save-draft"; return state
+    if re.search(r"\blist drafts?\b", low):
+        state["intent"] = "list-drafts"; return state
+    if re.search(r"\b(load|get back)\s+draft\b", low) or re.search(r"\bload draft\b", low):
+        state["intent"] = "load-draft"; return state
+    if re.search(r"\bdelete draft\b", low):
+        state["intent"] = "delete-draft"; return state
+
+    # 7) SAVE INSIGHT (keep this AFTER the draft checks)
+    if re.search(r"\bsave\s+as\b", low):
+        state["intent"] = "save"
+        return state
+
+    if re.search(r"\b(create|build|generate|compose|write)\b", low):
+        # guard: if they explicitly say "update insight", let update handle it
+        if not re.search(r"\bupdate\b\s+(?:insight\s+)?[a-z0-9_\-]+", low):
+            state["intent"] = "create"
+            return state
+
+    # 2) REFINE: adjust last SQL
+    if re.search(r"\b(refine|modify|tweak|adjust|rework|edit)\b", low) or \
+       re.search(r"\b(add|remove)\b.*\b(filter|limit|column|join)\b", low):
+        if state.get("last_sql"):
+            state["intent"] = "refine"
+            return state
+
+    # 3) PREVIEW: natural “show/get/fetch … records/rows/data from …”
+    if re.search(r"\b(show|get|fetch)\s+(?:all\s+)?(?:rows|records|data)\s+from\b", low):
+        state["intent"] = "preview"
+        return state
+    if re.search(r"\bpreview\b", low):
+        state["intent"] = "preview"
+        return state
+
+    # 4) VALIDATE / LINT
+    if re.search(r"\b(validate|lint|check)\b", low):
+        state["intent"] = "validate"
+        return state
+
+    # 5) SAVE INSIGHT
+    if re.search(r"\bsave\s+as\b", low):
+        state["intent"] = "save"
+        return state
+
+    # 6) DRAFTS
+    if re.search(r"\bsave draft\b", low):
+        state["intent"] = "save-draft"; return state
+    if re.search(r"\blist drafts?\b", low):
+        state["intent"] = "list-drafts"; return state
+    if re.search(r"\b(load|get back)\s+draft\b", low) or re.search(r"\bload draft\b", low):
+        state["intent"] = "load-draft"; return state
+    if re.search(r"\bdelete draft\b", low):
+        state["intent"] = "delete-draft"; return state
+
     # LLM semantic parse (intent + slots)
     parsed = gpt_parse_intent(txt, catalog.list_schemas(), list(tools.saved.values()))
     if parsed:
@@ -740,10 +1059,17 @@ def router_node(state: Dict[str, Any]) -> Dict[str, Any]:
         slots = parsed.get("slots",{}) or {}
         # Normalize via embeddings; if low-confidence, normalize the utterance instead
         norm_from_label = INTENT_INDEX.normalize(raw_intent)
-        if conf < 0.6 or norm_from_label == "unknown":
-            norm_intent = INTENT_INDEX.normalize(txt)
-        else:
-            norm_intent = norm_from_label
+        norm_intent = norm_from_label if conf >= 0.6 and norm_from_label != "unknown" else INTENT_INDEX.normalize(txt)
+
+        if norm_intent == "update" and re.search(r"\b(create|build|generate|compose|write)\b", low):
+            norm_intent = "create"
+        # If 'update' is chosen but there's no saved insight name and no update-like keywords, fallback to 'refine' (if last_sql) or 'create'
+        if norm_intent == "update" and not re.search(r"\bupdate\b", low):
+            if state.get("last_sql"):
+                norm_intent = "refine"
+            else:
+                norm_intent = "create"
+
         state["_slots"] = slots
         state["intent"] = norm_intent
         return state
@@ -761,6 +1087,15 @@ def router_node(state: Dict[str, Any]) -> Dict[str, Any]:
     if re.search(r"\b(fetch|get|show)\s+(?:all\s+)?(?:rows|records|data)\s+from\b", low):
         state["intent"] = "preview";
         return state
+    if re.search(r"\bsave draft\b", low):
+        state["intent"] = "save-draft"; return state
+    if re.search(r"\blist drafts?\b", low):
+        state["intent"] = "list-drafts"; return state
+    if re.search(r"\b(load|get back)\s+draft\b", low) or re.search(r"\bload draft\b", low):
+        state["intent"] = "load-draft"; return state
+    if re.search(r"\bdelete draft\b", low):
+        state["intent"] = "delete-draft"; return state
+
     # If still nothing, embedding normalize whole utterance
     state["intent"] = INTENT_INDEX.normalize(txt) or "unknown"
     return state
@@ -775,6 +1110,15 @@ def offtopic_node(state: Dict[str, Any]) -> Dict[str, Any]:
            "- preview / validate / save as my_attr ttl 14 active true")
     state["messages"].append({"role":"assistant","content":msg})
     return state
+
+    if re.search(r"\bsave draft\b", low):
+        state["intent"] = "save-draft"; return state
+    if re.search(r"\blist drafts?\b", low):
+        state["intent"] = "list-drafts"; return state
+    if re.search(r"\b(load|get back)\s+draft\b", low) or re.search(r"\bload draft\b", low):
+        state["intent"] = "load-draft"; return state
+    if re.search(r"\bdelete draft\b", low):
+        state["intent"] = "delete-draft"; return state
 
 def discover_schemas_node(state: Dict[str, Any]) -> Dict[str, Any]:
     lines = [f"`{s['name']}` — {s['description']}" for s in catalog.list_schemas()]
@@ -1047,6 +1391,98 @@ def unknown_node(state: Dict[str, Any]) -> Dict[str, Any]:
     state["messages"].append({"role":"assistant","content":"I’m not sure I can help with that.\nTry:\n- what data do you have?\n- list tables in sales\n- describe sales.orders\n- create revenue by segment last 30 days\n- preview / validate / save as my_attr ttl 14 active true"})
     return state
 
+def save_draft_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    txt = state["user_input"]
+    slots = state.get("_slots", {})
+    name = None
+
+    # 1) LLM slot
+    if "draft" in slots and isinstance(slots["draft"], dict):
+        name = slots["draft"].get("name")
+
+    # 2) Explicit phrasing “save draft as <name>”
+    if not name:
+        m = re.search(r"\bsave\s+(?:as\s+)?draft\s+as\s+([a-z0-9_\-]+)", txt, re.I)
+        if m:
+            name = m.group(1)
+
+    # 3) If user just said “save as draft” / “save draft” with no name → auto-name
+    if not name and re.search(r"\bsave\s+(?:as\s+)?draft\b", txt, re.I):
+        name = f"draft_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # 4) If still no name, ask for it
+    if not name:
+        state["messages"].append({"role":"assistant","content":"Please provide a draft name, e.g., `save draft as my_work`."})
+        return state
+
+    # Need SQL in context
+    sql = state.get("last_sql")
+    if not sql:
+        state["messages"].append({"role":"assistant","content":"There is no SQL in context to save. Create or paste SQL first."})
+        return state
+
+    rec = tools.save_draft(name, sql)
+    state["current_draft_id"] = rec["id"]
+    state["messages"].append({"role":"assistant","content":f"Saved draft `{name}`. You can continue exploring and later `load draft {name}` to resume."})
+    return state
+
+def list_drafts_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    drafts = tools.list_drafts()
+    if not drafts:
+        state["messages"].append({"role":"assistant","content":"No drafts yet. After you create SQL, use `save draft as <name>`."})
+        return state
+    lines = [f"`{d['name']}` (id: {d['id'][:8]}…)" for d in drafts]
+    reply = md_list("**Drafts:**", lines)
+    state["messages"].append({"role":"assistant","content":reply})
+    return state
+
+def load_draft_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    txt = state["user_input"]
+    slots = state.get("_slots", {})
+    key = slots.get("draft_name")
+    if not key:
+        # try: load draft <name/id>
+        m = re.search(r"load\s+draft\s+([a-z0-9_\-]+)", txt, re.I)
+        if m:
+            key = m.group(1)
+    # If they said “get back my draft query” with no name, prefer last used draft
+    if not key and state.get("current_draft_id"):
+        key = state["current_draft_id"]
+    if not key:
+        state["messages"].append({"role":"assistant","content":"Which draft should I load? e.g., `load draft my_work` or `list drafts`"})
+        return state
+    rec = tools.get_draft(key)
+    if not rec:
+        state["messages"].append({"role":"assistant","content":f"Draft `{key}` not found. Try `list drafts`."})
+        return state
+    state["last_sql"] = rec["sql"]
+    state["current_draft_id"] = rec["id"]
+    state["messages"].append({"role":"assistant","content":f"Loaded draft `{rec['name']}` into context.\nNext: `preview` / `refine ...` / `validate` / `save as <name> ttl <d> active <true|false>`"})
+    return state
+
+def delete_draft_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    txt = state["user_input"]
+    slots = state.get("_slots", {})
+    key = slots.get("draft_name")
+    if not key:
+        m = re.search(r"delete\s+draft\s+([a-z0-9_\-]+)", txt, re.I)
+        if m:
+            key = m.group(1)
+    if not key:
+        state["messages"].append({"role":"assistant","content":"Which draft should I delete? e.g., `delete draft my_work`"})
+        return state
+    ok = tools.delete_draft(key)
+    if not ok:
+        state["messages"].append({"role":"assistant","content":f"Draft `{key}` not found."})
+        return state
+    # clear pointer if we deleted the active one
+    if state.get("current_draft_id"):
+        rec = tools.get_draft(state["current_draft_id"])
+        if not rec:
+            state["current_draft_id"] = None
+    state["messages"].append({"role":"assistant","content":f"Deleted draft `{key}`."})
+    return state
+
 # Build LangGraph
 from langgraph.graph import StateGraph, END
 
@@ -1068,6 +1504,10 @@ graph.add_node("update", update_node)
 graph.add_node("explain-insight", explain_insight_node)
 graph.add_node("explain-sql", explain_sql_node)
 graph.add_node("unknown", unknown_node)
+graph.add_node("save-draft", save_draft_node)
+graph.add_node("list-drafts", list_drafts_node)
+graph.add_node("load-draft", load_draft_node)
+graph.add_node("delete-draft", delete_draft_node)
 
 graph.set_entry_point("router")
 
@@ -1090,10 +1530,15 @@ graph.add_conditional_edges("router", route, {
   "explain-insight":"explain-insight",
   "explain-sql":"explain-sql",
   "unknown":"unknown",
+  "save-draft":"save-draft",
+  "list-drafts":"list-drafts",
+  "load-draft":"load-draft",
+  "delete-draft":"delete-draft",
 })
 
 for n in ["help","offtopic","discover-schemas","select-schemas","discover-tables","describe-table",
-          "create","refine","validate","preview","save","update","explain-insight","explain-sql","unknown"]:
+          "create","refine","validate","preview","save","update","explain-insight","explain-sql",
+          "save-draft","list-drafts","load-draft","delete-draft","unknown"]:
     graph.add_edge(n, END)
 
 app = graph.compile()
