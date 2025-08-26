@@ -1,0 +1,165 @@
+/* Full-height layout */
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* Main app container */
+.chat-container {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Only this area scrolls */
+.chat-scroll {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 0;
+}
+
+/* Composer fixed (sticky) to bottom */
+.composer {
+  position: sticky;
+  bottom: 0;
+  background: #fff;
+  border-top: 1px solid #000;
+  padding: 12px;
+  z-index: 5; /* stays above content */
+}
+
+.bubble {
+  max-width: 75%;
+  padding: 16px;
+  border-radius: 12px !important;
+  box-shadow: none !important; /* remove Paper shadow */
+}
+
+/* User bubble: darker gray */
+.bubble-user {
+  background-color: #d9d9d9 !important;
+  color: #000 !important;
+}
+
+/* Assistant bubble: lighter gray */
+.bubble-assistant {
+  background-color: #f7f7f8 !important;
+  color: #000 !important;
+}
+
+/* Loader bubble */
+.loader-bubble {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+.loader {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.loader-dot {
+  width: 8px;
+  height: 8px;
+  background: #000;
+  border-radius: 50%;
+  display: inline-block;
+  animation: loaderPulse 1.2s infinite ease-in-out;
+}
+.loader-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.loader-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes loaderPulse {
+  0%,
+  80%,
+  100% {
+    transform: scale(0.8);
+    opacity: 0.6;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* SQL highlighting (monochrome) */
+.code-block {
+  background: #fafafa;
+  border: 1px solid #000;
+  border-radius: 10px;
+  padding: 12px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Liberation Mono",
+    Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.sql-k {
+  font-weight: 700;
+  text-decoration: underline;
+}
+.sql-f {
+  font-weight: 600;
+}
+.sql-s {
+  color: #555;
+  font-style: italic;
+}
+.sql-n {
+  color: #222;
+}
+.sql-c {
+  color: #777;
+  font-style: italic;
+}
+
+/* Results table wrapper */
+.table-wrap {
+  border: 1px solid #000;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.chat-container {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.chat-scroll {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 0 96px;
+  scroll-behavior: smooth;
+}
+.composer {
+  position: sticky;
+  bottom: 0;
+  background: #fff;
+  border-top: 1px solid #000;
+  padding: 12px;
+  z-index: 5;
+}
+
+/* Gray bubbles (no borders) */
+.bubble {
+  max-width: 75%;
+  padding: 16px;
+  border-radius: 12px !important;
+  box-shadow: none !important;
+}
+.bubble-user {
+  background-color: #d9d9d9 !important;
+  color: #000 !important;
+}
+.bubble-assistant {
+  background-color: #f7f7f8 !important;
+  color: #000 !important;
+}
+
+/* Loader and SQL styles from previous message can stay the same */
